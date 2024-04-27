@@ -1,0 +1,32 @@
+"","Study Name","Number of Samples"
+"ACC","Adrenocortical carcinoma",79
+"BLCA","Bladder Urothelial Carcinoma",424
+"BRCA","Breast invasive carcinoma",847
+"CESC","Cervical squamous cell carcinoma and endocervical adenocarcinoma",309
+"CHOL","Cholangiocarcinoma",45
+"COAD","Colon adenocarcinoma",221
+"DLBC","Lymphoid Neoplasm Diffuse Large B-cell Lymphoma",47
+"ESCA","Esophageal carcinoma",195
+"HNSC","Head and Neck squamous cell carcinoma",524
+"KICH","Kidney Chromophobe",91
+"KIRC","Kidney renal clear cell carcinoma",326
+"KIRP","Kidney renal papillary cell carcinoma",323
+"LGG","Brain Lower Grade Glioma",526
+"LIHC","Liver hepatocellular carcinoma",419
+"LUAD","Lung adenocarcinoma",469
+"LUSC","Lung squamous cell carcinoma",380
+"MESO","Mesothelioma",87
+"OV","Ovarian serous cystadenocarcinoma",291
+"PAAD","Pancreatic adenocarcinoma",183
+"PCPG","Pheochromocytoma and Paraganglioma",187
+"PRAD","Prostate adenocarcinoma",546
+"READ","Rectum adenocarcinoma",76
+"SARC","Sarcoma",261
+"SKCM","Skin Cutaneous Melanoma",451
+"STAD","Stomach adenocarcinoma",405
+"TGCT","Testicular Germ Cell Tumors",156
+"THCA","Thyroid carcinoma",567
+"THYM","Thymoma",122
+"UCEC","Uterine Corpus Endometrial Carcinoma",197
+"UCS","Uterine Carcinosarcoma",56
+"UVM","Uveal Melanoma",80
