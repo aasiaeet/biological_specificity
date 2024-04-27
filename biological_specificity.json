@@ -1,0 +1,9 @@
+{
+  "paths" : {
+      "raw"     : "C:/database/BetaZIF/raw",
+      "clean"   : "C:/database/BetaZIF/clean",
+	    "figures"   : "../results/figures",
+      "results"   : "../results",
+      "scratch" : "C:/database/BetaZIF/scratch"
+	 }
+}
