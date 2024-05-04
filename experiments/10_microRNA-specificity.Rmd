@@ -86,6 +86,7 @@ We order that miRs according to the number of zeros they have, i.e., miRs with m
 nonzeros <- ncol(miRdata) - numberOfZeros
 ordered_mir_data <- miRdata[order(nonzeros),]
 nonzeros <- sort(nonzeros)
+print(length(nonzeros))
 ```
 
 In our analysis, we aim to determine a cutoff for retaining miRs that are expressed in only a single or a select few cancer types, despite being undetected in others. One way to find that out would be to perform a chi-squared test comparing presence/absence with cancer cohort. The only problem with that idea when having nonzero elements is a rare event is that the normal approximation that justifies using the chi-squared test fails to hold.
@@ -152,7 +153,7 @@ source("../methods/04_beta_mixture_rate_class.R")
 
 
 ## Sampling from the Joint Posterior 
-Next we sample from the joint posterior of the parameters give the data. We use the chain rule to first sample the hyperpriors given the data and then the other paramters given the sampled hyperpriors. After sampling from the posterior, we compute the Fisher Criterion (or as named in the paper: Presence-Absence Contextuality (PAC) score) and save it in the object. 
+Next we sample from the joint posterior of the parameters give the data. We use the chain rule to first sample the hyperpriors given the data and then the other paramters given the sampled hyperpriors. After sampling from the posterior, we compute the Fisher Criterion (or as named in the paper: Presence-Absence Contextuality (CAPS) score) and save it in the object. 
 ```{r , warning = FALSE}
 source("../methods/05_posterior_sampling.R")
 ```
@@ -160,28 +161,36 @@ source("../methods/05_posterior_sampling.R")
 
 # TCGA's microRNA Analysis
 Now, we run our Bayesian inference pipeline on the microRNA data from the TCGA. We have already sorted them based on the number of non-zero elements. So we skip microRNAs that are always zero (of course they should get discarded) or always one (they should get retained, but if they are not variable they may not get selected in the selection process for the downstream analysis) for this analysis. 
+
+
 ```{r giant}
 library(dplyr)
+library(doParallel)
+library(foreach)
+
 set.seed(12345)
 beansdir<- file.path(paths$scratch, "BeanMixture")
 if (!file.exists(beansdir)) dir.create(beansdir)
 res <- 300
 
-f <- file.path(paths$scratch, 'allStat.rda')
-g <- file.path(paths$scratch, 'brlist.rda')
-h <- file.path(paths$scratch, 'postlist.rda')
-
+f <- file.path(paths$scratch, 'parallel_results.rda')
 if (file.exists(f)) {
   load(f)
-  load(g)
-  load(h)
 } else {
-  postlist <- brlist <- list()
-  allStat <- c()
-  for (I in 1:length(nonzeros)) { #for each miR
-    if (nonzeros[I] < n_always_absent) next #skip the first 4 miRs, they are always zero
-    if (nonzeros[I] > n_always_present) break #skip the last 134 miRs, they are always present.
+  numCores <- parallel::detectCores()  # Use detectCores from the parallel package
+  cl <- makeCluster(numCores)
+  registerDoParallel(cl)
+  lo = quantile(nonzeros, 0.05)
+  hi = quantile(nonzeros, 0.8)
+  nonzeros_index = which(nonzeros >= lo & nonzeros <= hi)
+  lengthnonzeros = length(nonzeros)
+  parallel_results <- foreach(I = nonzeros_index, .combine = 'list', .multicombine = TRUE, .packages = c("dplyr")) %dopar% {
+
+    ### Added for dopar
+    source("../methods/04_beta_mixture_rate_class.R")
+    
     print(I)
+    I
     mir <- rownames(ordered_mir_data)[I]
     # make a binary vector of zero or not.
     X <- c("NonZero", "Zero")[1 + 1*(ordered_mir_data[I,] == 0)]
@@ -190,11 +199,16 @@ if (file.exists(f)) {
     K <- tab[,1]
     N <- apply(tab, 1, sum)
     # Compute the posterior of the hyperpriors
+    print('@1')
     br <- BetaMixtureRates(K, N, dPi=1/10, massTrsh=0.87, resolution=10)
-    brlist[[mir]] <- br
+    
+    print('@2')
+    ### brlist[[mir]] <- br
     # Sample from the joint posterior distribution.
     post <- samplePosteriorRates(br, dPi=1/10, nsamp = 4000)
-    postlist[[mir]] <- post
+    
+    print('@3')
+    ### postlist[[mir]] <- post
     
     mt <- apply(post$theta, 2, mean)
     O <- order(mt)
@@ -208,9 +222,34 @@ if (file.exists(f)) {
     dev.off()
   
     ourstats <- c(mir, nonzeros[I], mt, post$fisherC)
-    allStat <- rbind(allStat, ourstats)
-      
+    ### allStat <- rbind(allStat, ourstats)
+    
+    list(mir=mir, br=br, post=post, ourstats=ourstats)
   }
+  
+  stopCluster(cl)
+  
+  save(parallel_results, file=f)
+}
+  
+```
+
+```{r}
+f <- file.path(paths$scratch, 'allStat.rda')
+g <- file.path(paths$scratch, 'brlist.rda')
+h <- file.path(paths$scratch, 'postlist.rda')
+postlist <- brlist <- list()
+allStat <- c()
+  
+if (!file.exists(f)) {
+  for (i in 1:length(parallel_results)) {
+    single_result = parallel_results[[i]]
+    mir <- single_result$mir
+    brlist[[mir]] <- single_result$br
+    postlist[[mir]] <- single_result$post
+    allStat <- rbind(allStat, single_result$ourstats)
+  }
+  
   rownames(allStat) <- allStat[,1] #mirs as rownames
   allStat <- allStat[,-1]
   colnames(allStat)[c(1, 33)] <- c("nonzero", "fisherC")
@@ -223,9 +262,35 @@ if (file.exists(f)) {
 rm(f, g, h)
 ```
 
-
 ## Inspecting the Specificity Statistics
 Let's take a look at specificity (Fisher) scores distributions for all miRs:
+```{r , warning = FALSE}
+library(ggplot2)
+
+# Assuming fc is your data vector
+# Applying log transformation directly in the data frame creation
+fc_data <- data.frame(Scores = log(fc))
+
+# Creating a ggplot histogram with updated aesthetics
+fc_hist <- ggplot(fc_data, aes(x = Scores)) +
+  geom_histogram(bins = 50, fill = "#FF5733", color = "black") +  # Using a vibrant orange color
+  labs(title = "CAPS Score Distribution", x = "Log of CAPS Score", y = "Frequency") +
+  theme_minimal() +  # Using a minimal theme
+  theme(
+    plot.title = element_text(size = 30, face = "bold"),
+    axis.title.x = element_text(size = 28),
+    axis.title.y = element_text(size = 28),
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    legend.position = "none"  # No legend needed
+  )
+
+# Print the histogram
+print(fc_hist)
+
+
+```
+
 ```{r , warning = FALSE}
 dim(allStat)
 fc <- allStat[,33]
@@ -239,42 +304,82 @@ There are 199 miRs with specificity > 1.
 Let's plot the extremes:
 
 ```{r manip, warning = FALSE}
-for(mir in rownames(allStat)[which(fc > 50)]){
-  x <- allStat[mir, 2:32]
-  par(mfrow=c(1,2))  
-  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
-  O <- order(x)
-  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
-        ylab="Probability of Being NonZero",
-        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
-                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
-        ylim=c(0,1), las=2)
+plot_the_boxes <- function(mir, mir_rates){
+  # Retrieve the matrix, and apply ordering to columns
+  theta_matrix <- as.matrix(mir_rates[, O])
+  cancer_types <- colnames(mir_rates)[O]  # Get ordered cancer types
+
+  # Convert matrix to data frame for ggplot
+  theta_data <- melt(theta_matrix)
+  colnames(theta_data) <- c("Sample", "CancerType", "Value")
+  theta_data$CancerType <- factor(theta_data$CancerType, levels = cancer_types)
+
+  # Create ggplot
+  p <- ggplot(theta_data, aes(x = CancerType, y = Value, fill = CancerType)) +
+    geom_boxplot(outlier.colour = "black", outlier.shape = 1) +  # Show outliers as black dots
+    scale_fill_manual(values = cohortColors[cancer_types]) +  # Apply colors to cancer types
+    labs(title = paste0("Posterior Distributions of Theta for ", mir, ", CAPS Score = ", 
+                       formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)),
+         y = "Probability of Being None Zero") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 15),
+          axis.text.y = element_text(size = 15),
+          plot.title = element_text(size = 30),
+          axis.title.x = element_blank(),  # Typically no need for X-axis title in this context
+          axis.title.y = element_text(size = 28),
+          legend.position = "none")  # Remove legend
+
+  print(p)  # Print the plot
+  
+  res <- 300
+  png(file.path(paths$results, paste(mir, '_plot.png'), sep = ""), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
+  grid.draw(p)
+  dev.off()
 }
+
+library(ggplot2)
+library(reshape2)
+
+# Assuming allStat and postlist are pre-loaded and properly formatted
+fc_indices <- which(fc > 50)  # Assuming 'fc' is defined in your context
+for(mir in rownames(allStat)[fc_indices]) {
+  x <- allStat[mir, 2:32]
+  O <- order(x)  # Order might be used to sort cancer types by some statistic in 'x'
+  plot_the_boxes(mir, postlist[[mir]]$theta)
+}
+
+
+
 ```
 
 Interestingly, in all these four cases the miRNA separates OV, COAD, READ from the rest of cancer types, while the expression pattern is different: in the first one it is only present in those cancer (a clear case of why we should keep `hsa-miR-3913-5p`) while in the next three it is present everywhere except in those three. 
 
-Let's skip the extremes and take another look at the histogram and the Presence-Absence Contextuality (PAC) scores' tail:
+Let's skip the extremes and take another look at the histogram and the Contextual Absence-Presence Specificity (CAPS) scores' tail:
 ```{r truncHist, warning = FALSE}
-hist(fc[-which(fc > 50)], breaks = 50, main = "PAC Score")
+hist(fc[-which(fc > 50)], breaks = 50, main = "CAPS Score")
 
-for(mir in rownames(allStat)[which(fc > 10 & fc < 50)]){
+library(ggplot2)
+library(reshape2)
+
+for(mir in rownames(allStat)[which(fc > 10 & fc < 50)]) {
   x <- allStat[mir, 2:32]
-  par(mfrow=c(1,2))  
-  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
-  O <- order(x)
-  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
-        ylab="Probability of Being NonZero",
-        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
-                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
-        ylim=c(0,1), las=2)
+  O <- order(x)  # Order might be used to sort cancer types by some statistic in 'x'
+  plot_the_boxes(mir, postlist[[mir]]$theta)
 }
+
+
 ```
-Still it seems that large FC corresponds to clear separability of means, i.e., we have two clusters of tissues. 
+Still it seems that large FC corresponds to clear separability of means, i.e., we have two clusters of tissues.
 
-## MicroRNAs with High PAC Score are Different from Highly Variable MicroRNAs
+Now cherry picking some middle ground microRNA for the paper:
 
-To demonstrate that PAC score captures biological significance, we compare the efficacy of microRNAs (miRs) selected based on high PAC scores against miRs chosen for their high variability. This comparison aims to elucidate whether PAC scores can indeed reflect biological relevance similar to or better than traditional methods of feature selection based on variability.
+hsa-miR-3940-3p
+
+
+
+## MicroRNAs with High CAPS Score are Different from Highly Variable MicroRNAs
+
+To demonstrate that CAPS score captures biological significance, we compare the efficacy of microRNAs (miRs) selected based on high CAPS scores against miRs chosen for their high variability. This comparison aims to elucidate whether CAPS scores can indeed reflect biological relevance similar to or better than traditional methods of feature selection based on variability.
 
 
 First, let's remember that the data was CPM normalized:
@@ -291,15 +396,47 @@ log_miRdata <- log2(miRdata + 1)
 
 mean_log_expr <- rowMeans(log_miRdata)
 var_log_expr <- apply(log_miRdata, 1, var)
+# Create a dataframe from your data
+miRdata_df <- data.frame(
+  MeanLogExpr = mean_log_expr,
+  VarLogExpr = var_log_expr
+)
 
 # Fit a lowess curve to the variance vs. mean log expression
 lowess_fit <- lowess(mean_log_expr, var_log_expr)
 
-# Plot the variance vs. mean log expression with the lowess curve
-plot(mean_log_expr, var_log_expr, xlab = "Mean of Log Expression", ylab = "Variance of Log Expression",
-     main = "Variability of microRNAs with Lowess Fit", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.4))
-lines(lowess_fit, col = "red", lwd = 2)
+# # Plot the variance vs. mean log expression with the lowess curve
+# plot(mean_log_expr, var_log_expr, xlab = "Mean of Log Expression", ylab = "Variance of Log Expression",
+#      main = "Variability of microRNAs with Lowess Fit", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.4))
+# lines(lowess_fit, col = "red", lwd = 2)
+library(ggplot2)
 
+# Create the plot using ggplot
+miR_plot <- ggplot(miRdata_df, aes(x = MeanLogExpr, y = VarLogExpr)) +
+  geom_point(color = rgb(0.2, 0.4, 0.6, 0.4), size = 2, shape = 20) +  # Adding points
+  geom_line(data = as.data.frame(lowess_fit), aes(x = x, y = y), color = "red", size = 1.5) +  # Adding lowess curve
+  labs(title = "Exploring microRNA Variability through Lowess Smoothing",
+       x = "Mean of Log Expression",
+       y = "Variance of Log Expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        plot.title = element_text(size = 30),
+        axis.title.x = element_text(size = 28),
+        axis.title.y = element_text(size = 28))
+
+# Print the plot
+print(miR_plot)
+
+
+res <- 300
+png(file.path(paths$results, 'miR_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
+grid.draw(miR_plot)
+dev.off()
+```
+
+Selecting highly variable microRNAs:
+```{r , warning = FALSE}
 # Identify microRNAs with variance above the lowess fit as highly variable
 high_var_indices <- var_log_expr > approx(lowess_fit$x, lowess_fit$y, xout = mean_log_expr)$y
 print(paste("Total number of highly variable microRNAs", sum(high_var_indices)))
@@ -310,7 +447,7 @@ top_high_var_miRs <- head(high_var_miRs[order(-var_log_expr[high_var_indices])],
 ```
 
 
-We select the similar number of miRs from the list of miRs sorted decreasingly according to their PAC scores. The goal is to determine if the two lists are similar. 
+We select the similar number of miRs from the list of miRs sorted decreasingly according to their CAPS scores. The goal is to determine if the two lists are similar. 
 ```{r , warning = FALSE}
 sorted_mir_pac_score <- names(fc)[order(fc, decreasing = T)] 
 top_high_spec_miRs <- head(sorted_mir_pac_score, number_of_highly_variable_mirs)
@@ -336,18 +473,49 @@ for (i in 1:number_of_highly_variable_mirs) {
   jaccard_distances[i] <- 1- (intersection_size / union_size)
 }
 
-# Plot the Jaccard distances
-plot(jaccard_distances, type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, number_of_highly_variable_mirs))
+jaccard_data <- data.frame(SetSize = 1:100, 
+                           JaccardDistance = jaccard_distances[1:100])
 
-plot(jaccard_distances[1:100], type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, 100))
+library(ggplot2)
+
+# Plotting using ggplot
+jaccard_plot <- ggplot(jaccard_data, aes(x = SetSize, y = JaccardDistance)) +
+  geom_line() +  # Adding a line
+  geom_point(size = 3, shape = 19) +  # Adding points
+  labs(title = "Jaccard Distance between Highly Variable and Highly Specific microRNAs Sets",
+       x = "Set Size",
+       y = "Jaccard Distance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        plot.title = element_text(size = 30),
+        axis.title.x = element_text(size = 28),
+        axis.title.y = element_text(size = 28)) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10))  # Setting x-axis breaks for clarity
+
+# Print the plot
+print(jaccard_plot)
+
+res <- 300
+png(file.path(paths$results, 'jaccard_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
+grid.draw(jaccard_plot)
+dev.off()
+
+
+# 
+# 
+# # Plot the Jaccard distances
+# plot(jaccard_distances, type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
+#      main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, number_of_highly_variable_mirs))
+# 
+# plot(jaccard_distances[1:100], type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
+#      main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, 100))
 
 ```
 In the first 100 microRNA the two sets share only 12 microRNAs, i.e., the set of highly variable genes and highly specific genes are approximately mutually exclusive. In other words, if we focus on highly variable genes we will miss the highly specific genes. Even if we increase the set size up to 568 (total number of highly variable microRNAs), the Jaccard distance is still .5. 
 
-## MicroRNAs with High PAC Score are Informative
-Here, we juxtapose miRs selected based on their high variability with those chosen for their high PAC scores. The aim is to assess the informational content of miRs selected via each criterion, particularly focusing on the biological insights they provide. We do this by using selected miRs by two criteria to perform cancer type classification. We run SVM 10 times while incrementally increasing the number of microRNAs considered by 10 for each of the two sets of selected miRNAs, and then plotting the performance of these selection methods on cancer type classification. 
+## MicroRNAs with High CAPS Score are Informative
+Here, we juxtapose miRs selected based on their high variability with those chosen for their high CAPS scores. The aim is to assess the informational content of miRs selected via each criterion, particularly focusing on the biological insights they provide. We do this by using selected miRs by two criteria to perform cancer type classification. We run SVM 10 times while incrementally increasing the number of microRNAs considered by 10 for each of the two sets of selected miRNAs, and then plotting the performance of these selection methods on cancer type classification. 
 
 ### Intelligent Highly Specific Feature Addition
 
@@ -505,7 +673,7 @@ if(file.exists(f)){
 }
 ```
 
-### Transforming the list into a data frame suitable for plotting with ggplot2
+Transforming the list into a data frame suitable for plotting with ggplot2
 
 ```{r , warning = FALSE}
 # Transforming the list into a data frame suitable for plotting with ggplot2
@@ -529,7 +697,7 @@ for (feature_selection_method in c("High_Var", "High_Spec", "Diverse_High_Spec",
 }
 ```
 
-### Plotting
+Plotting
 ```{r , warning = FALSE}
 library(dplyr)
 
@@ -572,121 +740,104 @@ accuracy_plot <- ggplot(accuracy_summary, aes(x = NumberOfFeatures, y = MeanAccu
        color = "Feature Selection Method",
        fill = "Feature Selection Method") +  # Label for the legend
   theme_minimal() + 
-  theme(legend.position = c(0.9, 0.1),  # Sets the position of the legend inside the plot
+  theme(axis.text.x = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        legend.position = c(0.9, 0.1),  # Sets the position of the legend inside the plot
         legend.justification = c(1, 0),  # Anchors the legend at the bottom right
         legend.background = element_rect(fill = "white", colour = "black"),  # Optional: Adds a background to the legend for visibility
-        legend.box.background = element_rect(color = "black", size = 0.5))  # Optional: Adds border to the legend box
+        legend.box.background = element_rect(color = "black", size = 0.5),  # Optional: Adds border to the legend box
+        plot.title = element_text(size = 30),  # Increase title font size
+        axis.title.x = element_text(size = 28),  # Increase x-axis label font size
+        axis.title.y = element_text(size = 28),  # Increase y-axis label font size
+        legend.text = element_text(size = 26),
+        legend.title = element_text(size = 28, face = "bold", color = "black"))  # Increase legend text size
+
 
 print(accuracy_plot)
 
+res <- 300
+png(file.path(paths$results, 'accuracy_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
+grid.draw(accuracy_plot)
+dev.off()
 ```
-
 
 ## Viszualizing Error Sources
 Plotting the accuracies:
 
 ```{r , warning = FALSE}
-
 library(ggplot2)
 library(reshape2)
+library(gridExtra)
+library(grid)
 
-# Compare average confusion matrices for a specific feature set size
-i <- 1  # Example: Compare for 100 features (10th iteration)
-hvg_index <- paste0("High_Var", "_", "svm")
-hsg_index <- paste0("Diverse_High_Spec", "_", "svm")
+# Data extraction and manipulation
+i <- 1
+hvg_index <- "High_Var_svm"
+hsg_index <- "High_Spec_svm"
 
-conf_diff <- conf_matrices[[hvg_index]][[i]]  - conf_matrices[[hsg_index]][[i]]
-diag(conf_diff) <- 0
-col_sums <- colSums(conf_diff)
+hvg_matrix <- as.matrix(conf_matrices[[hvg_index]][[i]])
+hsg_matrix <- as.matrix(conf_matrices[[hsg_index]][[i]])
+diag(hvg_matrix) <- diag(hsg_matrix) <- 0  # Zeroing the diagonals
 
-hvg_per_class_mistake <- conf_matrices[[hvg_index]][[i]]
-diag(hvg_per_class_mistake) <- 0
-col_sums_hvg <- colSums(hvg_per_class_mistake)
+conf_diff <- hvg_matrix - hsg_matrix
+diag(conf_diff) <- 0  # Zeroing the diagonal
 
-hsg_per_class_mistake <- conf_matrices[[hsg_index]][[i]]
-diag(hsg_per_class_mistake) <- 0
-col_sums_hsg <- colSums(hsg_per_class_mistake)
+col_sums <- colSums(conf_diff) / pmax(colSums(hvg_matrix), colSums(hsg_matrix))
+row_sums <- rowSums(conf_diff) / pmax(rowSums(hvg_matrix), rowSums(hsg_matrix))
 
-bar_to_plot <- c()
-for(i in 1:length(col_sums)){
-  if(col_sums[i] >= 0){
-    bar_to_plot[i] <- col_sums[i] / col_sums_hvg[i]
-  } else {
-    bar_to_plot[i] <- col_sums[i] / col_sums_hsg[i]
-  }
-}
-bar_to_plot <- bar_to_plot * 100;
-names(bar_to_plot) <- colnames(hsg_per_class_mistake)
-# Create a data frame for plotting column sums
-col_sums_df <- data.frame(Var2 = names(bar_to_plot), Sum = bar_to_plot)
+# Prepare data for plotting
+conf_diff_long <- melt(conf_diff, varnames = c("Var1", "Var2"), value.name = "value")
+col_sums_df <- data.frame(Var = names(col_sums), Sum = col_sums)
+row_sums_df <- data.frame(Var = names(row_sums), Sum = row_sums)
 
-# Normalize these sums for plotting (if necessary)
-col_sums_df$Sum <- col_sums_df$Sum / max(abs(col_sums_df$Sum))  # Normalize to max sum for proportional sizing
-
-# Determine the color scale dynamically based on values
-col_sums_df$color <- ifelse(col_sums_df$Sum >= 0, "red", "blue")
-
-library(ggplot2)
-library(reshape2)
-
-# Start ggplot
-p <- ggplot(data = conf_diff_long, aes(x = Var1, y = Var2, fill = value)) +
-  geom_tile() +  # Heatmap
+# Heatmap plot
+heatmap_plot <- ggplot(conf_diff_long, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
   scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
-  geom_col(data = col_sums_df, aes(x = Var2, y = Sum, fill = Sum), width = 1, show.legend = FALSE) +
-  scale_fill_gradient(name = "Bar Scale", low = "blue", high = "red", limits = c(min(col_sums_df$Sum), max(col_sums_df$Sum))) +
-  coord_fixed(ratio = 1) +  # Ensure the tiles are square by fixing aspect ratio
-  labs(x = "Actual Class", y = "Predicted Class", fill = "Difference in Classifications") +
   theme_minimal() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  coord_fixed()  # Ensuring aspect ratio is 1
 
-print(p)
-
-
-# Melt the difference matrix for ggplot
-conf_diff_long <- melt(conf_diff, varnames = c("Var1", "Var2"))
-names(conf_diff_long) <- c("Var1", "Var2", "value")
-
-library(ggplot2)
-library(reshape2)
-
-# Assuming all data preparation steps as defined earlier
-
-# Adjust the width and position of the bars
-bar_width <- 0.5  # Width of the bars; adjust as needed to fit the plot aesthetics
-
-# Start ggplot
-p <- ggplot(data = conf_diff_long, aes(x = Var1, y = Var2, fill = value)) +
-  geom_tile() +  # Heatmap
-  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
-  coord_fixed(ratio = 1) +  # Ensure the tiles are square by fixing aspect ratio
-  labs(x = "Actual Class", y = "Predicted Class", fill = "Normalized Difference") +
+# Column sum bars plot
+col_bar_plot <- ggplot(col_sums_df, aes(x = Var, y = Sum)) +
+  geom_col(fill = "gray") +
   theme_minimal() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(10,123,10,73))  # Removing all margins around the plot
 
-print(p)
+# Row sum bars plot
+row_bar_plot <- ggplot(row_sums_df, aes(x = Var, y = Sum)) +
+  geom_col(fill = "gray") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(15,20,25,20))  # Removing all margins around the plot
+
+# Arrange the plots using gridExtra
+conf_plot <- grid.arrange(
+  col_bar_plot, nullGrob(), 
+  heatmap_plot, row_bar_plot,
+  ncol = 2, nrow = 2,
+  widths = c(4, 1), heights = c(1, 4)
+)
 
 
-
-```
-
-
-
-
-
-### Variable Filtering
-
-Here we want to pick top x% of miRs ordered decreasingly in PAC score. 
-
-```{r varFiltering, warning = FALSE}
-ssMirs <- names(fc)[order(fc, decreasing = T)] 
-cutOffs <- floor(quantile(1:length(ssMirs), probs=c(seq(0.02, 0.1, .02), seq(0.15, 0.3, .05), seq(.4, 1, .1))))
-
-featureList <- list()
-for(I in 1:length(cutOffs)){
-  featureList[[I]] <- ssMirs[1:cutOffs[I]]
-}
-
+res <- 300
+png(file.path(paths$results, 'confusion_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
+grid.draw(conf_plot)
+dev.off()
 
 ```
 

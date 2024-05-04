@@ -1,0 +1,670 @@
+---
+title: "Beta Mixture Rates Model for MicroRNA Cancer Type Specificity"
+author: "Amir Asiaee"
+date: '`r format(Sys.Date(), "%d %B, %Y")`' # Formats the date
+output: 
+  html_document:
+    toc: true # Adds a table of contents
+    toc_float: true # Floats the table of contents
+    toc_depth: 2 # Sets depth of headers to include in TOC
+    number_sections: true # Numbers the sections
+    highlight: kate # Syntax highlighting style
+    theme: yeti # Bootswatch theme
+    fig_width: 10 # Width of figures in inches
+    fig_height: 6 # Height of figures in inches
+    css: ../styles.css # Link to an external CSS file
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Background 
+The goal of this report is to check if our tissue specificity of miRs can be generalized to cell-type specificity in the Tabula Sepian data set. Note that we do not have a definition for cell-type specificity ahead of time. We only have some qualitative characteristics in mind. Biological specificity of a transcript should be independent of the rest or miRs and a miR is more tissue specific if it is expressed in smaller number of tissues. So any score for specificity should be a continuous value from 0 to infinity. This step is only for deciding which miR is informative for further analysis (such as classification of tissues, regression, etc.) so we do not need to worry about the effect of combination of miRs (redundency in specificity is not important, if miR1 and miR2 both are specific to breast, that is fine we keep both and let the down stream analysis decide what to do with the redundancy). 
+
+
+# Playing with Data
+
+
+First we want to get a sense of the Tabula Sepian data. For that we start with one tissue type and take a look into various parts of the available data. We picked blood because its data file had a reasonable ~1.5 G size, not too small, not too big. 
+
+## Data Exploration
+First we set up the paths to our data storage locations.
+```{r paths}
+rm(list = ls())
+source("../00_paths.R")
+```
+
+Then we read the data.
+```{r , warning = FALSE}
+# install.packages("anndata")
+# install.packages("reticulate")
+
+library(anndata)
+
+f <- file.path(paths$clean, 'ts', 'TS_Blood.h5ad') 
+adata <- read_h5ad(f)
+```
+
+Next, we tak a look at the transcripts. They seem to be normalized somehow:
+```{r , warning = FALSE}
+length(adata$obs$cell_ontology_class)
+dim(adata$X)
+nClass <- unique(adata$obs$cell_ontology_class)
+frq <- table(adata$obs$cell_ontology_class)
+hist(frq, breaks = length(nClass), main = "Distribution of number of cells per cell type")
+
+# old_par <- par()
+# par(mfrow = c(3, 2))
+#random
+# hist(adata$X[,colnames(adata$X)=='BRAF'], breaks=123, main='BRAF', xlab='CPM')
+# hist(adata$X[,colnames(adata$X)=='TP53'], breaks=123, main='TP53', xlab='CPM')
+#mostly expressed
+hist(adata$X[,colnames(adata$X)=='ACTB'], breaks=123, main='ACTB', xlab='CPM') #beta-actin - cytoskeleton gene
+hist(adata$X[,colnames(adata$X)=='RPS18'], breaks=123, main='RPS18', xlab='CPM') #ribosomal protein s18 - ribosome gene
+#specifically expressed in hemoglobin
+hist(adata$X[,colnames(adata$X)=='HBA1'], breaks=123, main='HBA1', xlab='CPM') #hemoglobin subunit alpha 1
+hist(adata$X[,colnames(adata$X)=='HBB'], breaks=123, main='HBB', xlab='CPM') #hemoglobin subunit beta
+# par(old_par)
+
+```
+From the distribution of number of cells per cell type we can tell that there are many cell types that are very rare and the distribution is kind of bimodal: exponential in the lower end, uniform at the higher end. 
+
+I checked some random well-known cancer genes and there are almost always zero. Then I checked some genes that I believe they should be none-zero mostly because they are relevant to core biological processes. The number of none-zeros are much better for these two genes but still we have a huge zero component.
+
+Then I checked genes that are very specific to red blood cells and as expectd they have biomodal expressions: many zeros and some highly expressed. Note thate there are in reality three modes: zeros, 1 and > 6. Maybe ones are for some cell type or different cell state of the same cell type. 
+
+Next, we save the data and cell type because working with the `adata` directly is very slow. 
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, 'TS_blood.Rda') 
+if (file.exists(f)) {
+  load(f)
+} else {
+  X <- adata$X
+  ctype <- adata$obs$cell_ontology_class
+  save(X, ctype, file = f)
+}
+rm(adata)
+gc()
+dim(X)
+```
+
+Here we put together "Table 1", a count of the number of samples from each cell type.
+```{r}
+tab <- table(ctype)
+length(tab)
+daft <- data.frame(tab)
+colnames(daft) <- c("Study Name", "Number of Samples")
+write.csv(daft, file=file.path(paths$scratch, "sampleCount_TS_blood.csv"))
+head(daft)
+sum(ctype %in% names(tab[tab > 100]))
+S <- ctype %in% names(tab[tab > 100])
+subC <- droplevels(ctype[S])
+sX <- X[S,]
+```
+
+
+We (believe that we may) want to remove mRNAs that frequently give zero counts in sequencing experiments. So, we start by counting the number of such zeros.
+
+```{r numberOfZeros, fig.cap="Histogram of the number of zero counts observed per mRNA",fig.width=8,fig.height=6}
+nnz <- tabulate(sX@j + 1L, ncol(sX)) #nnz per column (mRNA)
+range(nnz)
+hist(1 - nnz/nrow(sX), breaks=123, col="gray75", main="", 
+     xlab="Fraction of zero counts per mRNA", ylab="Number of mRNAs")
+
+sum(nnz == 0)
+sum(nnz <= min(tab))
+
+```
+So, there are 5989 mRNAs that have exactly zero count which we can not do anything about them. Also, if nnz < minimum number of samples per cell type, we can not do anything about them. So we remove those mRNAs from further consideration. 
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, 'TS_sub_blood_10p.Rda') 
+if (file.exists(f)) {
+  load(f)
+} else {
+  ind <- nnz > 5000
+  subX <- sX[,ind]
+  ctype <- subC
+  save(subX, ctype, file = f)
+}
+```
+
+We order that mRNAs according to the number of zeros they have, i.e., miRs with most zeros are processed first:
+
+```{r results}
+library(Matrix)
+nnz <- tabulate(subX@j + 1L, ncol(subX)) #nnz per column (mRNA)
+tempd <- t(as.matrix((subX[,order(nnz)])))
+nonzeros <- sort(nnz)
+```
+
+```{r makeRoom}
+rm(X, subX, subC)
+gc()
+```
+
+
+# Bayesian Mixture Rates
+Here we just load the scripts where we have developed the model. 
+
+```{r loading model scripts, warning = FALSE}
+source("../methods/01_gamma_ratios.R")
+source("../methods/02_hyper_priors.R")
+source("../methods/03_integral_over_pi.R")
+source("../methods/04_beta_mixture_rate_class.R")
+source("../methods/05_posterior_sampling.R")
+```
+
+# Tabula Sapiens Blood sc-RNA Seq Analysis
+
+This is the place to do parallel:
+```{r giant}
+library(dplyr)
+# library(viridis)
+library(tictoc)
+set.seed(12345)
+beansdir<- file.path(paths$scratch, "BeanMixture-TS-Blood-10percent")
+if (!file.exists(beansdir)) dir.create(beansdir)
+res <- 300
+cohortColors <- viridis(length(unique(ctype)))
+
+f <- file.path(paths$scratch, 'allStat-TS-Blood_10p.rda')
+g <- file.path(paths$scratch, 'brlist-TS-Blood_10p.rda')
+h <- file.path(paths$scratch, 'postlist-TS-Blood_10p.rda')
+
+if (file.exists(f)) {
+  load(f)
+  load(g)
+  load(h)
+} else {
+  postlist <- brlist <- list()
+  allStat <- c()
+  for (I in 1:length(nonzeros)) { #for each mRNA
+  # for (mRNA in c('ARPC2', 'ATP5F1E', 'RPL12', 'RPL36', 'YWHAZ', 'ZFAND5')){
+    tic()
+    print(I)
+    mRNA <- rownames(tempd)[I]
+    
+    # I <- which(rownames(tempd) == mRNA)
+    
+    # make a binary vector of zero or not.
+    X <- c("NonZero", "Zero")[1 + 1*(tempd[I,] == 0)]
+    cat("Working on", mRNA, "\n", file = stderr())
+    tab <- table(ctype, X)
+    K <- tab[,1]
+    N <- apply(tab, 1, sum)
+    # Compute the posterior of the hyperpriors
+    br <- BetaMixtureRates(K, N, dPi=1/5, massTrsh=0.87, resolution=10)
+    brlist[[mRNA]] <- br
+    # Sample from the joint posterior distribution.
+    post <- samplePosteriorRates(br, dPi=1/5, nsamp = 1000)
+    postlist[[mRNA]] <- post
+    
+    mt <- apply(post$theta, 2, mean)
+    O <- order(mt)
+    png(file=file.path(beansdir, paste(mRNA, "png", sep='.')), 
+         width=16*res, height=9*res, res=res, bg="white")
+    boxplot(as.matrix(post$theta[, O]), col=cohortColors[O], cex.axis=0.7,
+        ylab="Probability of Being NonZero",
+        main=paste("Posterior Dist. of Thetas for", mRNA, "Tissue Specificity = ", 
+                   formatC(post$fisherC, format = "e", digits = 2)), 
+        ylim=c(0,1), las=2)
+  
+    dev.off()
+  
+    ourstats <- c(mRNA, nonzeros[I], mt, post$fisherC)
+    allStat <- rbind(allStat, ourstats)
+    toc()
+  }
+  rownames(allStat) <- allStat[,1] #mRNAs as rownames
+  allStat <- allStat[,-1]
+  colnames(allStat)[c(1, ncol(allStat))] <- c("nnz", "fisherC")
+  allStat <- matrix(as.numeric(allStat), 
+                    ncol = ncol(allStat), dimnames = dimnames(allStat))
+
+  save(allStat, file = f)
+  save(brlist, file = g)
+  save(postlist, file = h)
+}
+rm(f, g, h)
+```
+
+
+## Inspecting the Specificity Statistics
+Let's take a look at specificity (Fisher) scores distributions for all miRs:
+```{r , warning = FALSE}
+dim(allStat)
+fc <- allStat[,33]
+sum(fc > 1)
+sum(fc > 100)
+fc[order(fc,decreasing = T)[1:4]]
+hist(fc[fc<100], breaks = 100, main = "Biological Specificity Scores")
+```
+There are four miRs which are extremely specific (the BSS is great than 300). After that the score drops to 21. 
+There are 199 miRs with specificity > 1. 
+Let's plot the extremes:
+
+```{r manip, warning = FALSE}
+for(mir in rownames(allStat)[which(fc > 50)]){
+  x <- allStat[mir, 2:32]
+  par(mfrow=c(1,2))  
+  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
+  O <- order(x)
+  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
+        ylab="Probability of Being NonZero",
+        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
+                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
+        ylim=c(0,1), las=2)
+}
+```
+
+Interestingly, in all these four cases the miRNA separates OV, COAD, READ from the rest of cancer types, while the expression pattern is different: in the first one it is only present in those cancer (a clear case of why we should keep `hsa-miR-3913-5p`) while in the next three it is present everywhere except in those three. 
+
+Let's skip the extremes and take another look at the histogram and the Contextual Absence/Presence Specificity (CAPS) scores' tail:
+```{r truncHist, warning = FALSE}
+hist(fc[-which(fc > 50)], breaks = 50, main = "PAC Score")
+
+for(mir in rownames(allStat)[which(fc > 10 & fc < 50)]){
+  x <- allStat[mir, 2:32]
+  par(mfrow=c(1,2))  
+  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
+  O <- order(x)
+  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
+        ylab="Probability of Being NonZero",
+        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
+                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
+        ylim=c(0,1), las=2)
+}
+```
+Still it seems that large FC corresponds to clear separability of means, i.e., we have two clusters of tissues. 
+
+## MicroRNAs with High PAC Score are Different from Highly Variable MicroRNAs
+
+To demonstrate that PAC score captures biological significance, we compare the efficacy of microRNAs (miRs) selected based on high PAC scores against miRs chosen for their high variability. This comparison aims to elucidate whether PAC scores can indeed reflect biological relevance similar to or better than traditional methods of feature selection based on variability.
+
+
+First, let's remember that the data was CPM normalized:
+```{r , warning = FALSE}
+hist(miRdata[1,], breaks = 123)
+```
+
+ 
+An essential step in the transcriptome analysis pipeline involves feature selection, especially for data characterized by frequent zeros or generally constant features. Eliminating such features is critical for enhancing the performance of downstream tasks. The conventional approach to determining high variability involves calculating the mean and variance of log-transformed expression levels and selecting miRs that stand out in terms of variability. We do this by fitting a Lowess curve to the variance vs. mean of log transformed expressions and select the miRs whose variance is greater than the variance predicted by this curve. This process highlights miRs that exhibit significant expression changes across samples, potentially reflecting crucial biological processes or states.
+
+```{r , warning = FALSE}
+# Log-transform the data (adding 1 to avoid log(0))
+log_miRdata <- log2(miRdata + 1)
+
+mean_log_expr <- rowMeans(log_miRdata)
+var_log_expr <- apply(log_miRdata, 1, var)
+
+# Fit a lowess curve to the variance vs. mean log expression
+lowess_fit <- lowess(mean_log_expr, var_log_expr)
+
+# Plot the variance vs. mean log expression with the lowess curve
+plot(mean_log_expr, var_log_expr, xlab = "Mean of Log Expression", ylab = "Variance of Log Expression",
+     main = "Variability of microRNAs with Lowess Fit", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.4))
+lines(lowess_fit, col = "red", lwd = 2)
+
+# Identify microRNAs with variance above the lowess fit as highly variable
+high_var_indices <- var_log_expr > approx(lowess_fit$x, lowess_fit$y, xout = mean_log_expr)$y
+print(paste("Total number of highly variable microRNAs", sum(high_var_indices)))
+number_of_highly_variable_mirs <- sum(high_var_indices)
+
+high_var_miRs <- rownames(miRdata)[high_var_indices]
+top_high_var_miRs <- head(high_var_miRs[order(-var_log_expr[high_var_indices])], number_of_highly_variable_mirs)
+```
+
+
+We select the similar number of miRs from the list of miRs sorted decreasingly according to their PAC scores. The goal is to determine if the two lists are similar. 
+```{r , warning = FALSE}
+sorted_mir_pac_score <- names(fc)[order(fc, decreasing = T)] 
+top_high_spec_miRs <- head(sorted_mir_pac_score, number_of_highly_variable_mirs)
+```
+
+Let's check if the two sets share a lot of elements:
+```{r , warning = FALSE}
+# Assuming top_high_var_miRs and top_high_spec_miRs are your microRNA sets
+
+# Initialize a vector to store Jaccard distances
+jaccard_distances <- numeric(number_of_highly_variable_mirs)
+
+# Calculate Jaccard distances for set sizes 1 to 100
+for (i in 1:number_of_highly_variable_mirs) {
+  set1 <- top_high_var_miRs[1:i]
+  set2 <- top_high_spec_miRs[1:i]
+  
+  # Calculate intersection and union
+  intersection_size <- length(intersect(set1, set2))
+  union_size <- length(union(set1, set2))
+  
+  # Calculate Jaccard distance
+  jaccard_distances[i] <- 1- (intersection_size / union_size)
+}
+
+# Plot the Jaccard distances
+plot(jaccard_distances, type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
+     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, number_of_highly_variable_mirs))
+
+plot(jaccard_distances[1:100], type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
+     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, 100))
+
+```
+In the first 100 microRNA the two sets share only 12 microRNAs, i.e., the set of highly variable genes and highly specific genes are approximately mutually exclusive. In other words, if we focus on highly variable genes we will miss the highly specific genes. Even if we increase the set size up to 568 (total number of highly variable microRNAs), the Jaccard distance is still .5. 
+
+## MicroRNAs with High PAC Score are Informative
+Here, we juxtapose miRs selected based on their high variability with those chosen for their high PAC scores. The aim is to assess the informational content of miRs selected via each criterion, particularly focusing on the biological insights they provide. We do this by using selected miRs by two criteria to perform cancer type classification. We run SVM 10 times while incrementally increasing the number of microRNAs considered by 10 for each of the two sets of selected miRNAs, and then plotting the performance of these selection methods on cancer type classification. 
+
+### Intelligent Highly Specific Feature Addition
+
+```{r , warning = FALSE}
+allStat_filtered <- allStat[, -c(1, ncol(allStat))]
+miR_mean_representation <- allStat_filtered[rownames(allStat_filtered) %in% top_high_spec_miRs, ]
+correlation_matrix <- cor(t(miR_mean_representation))
+
+
+# Initialize the list of selected miRs
+selected_miRs <- c(top_high_spec_miRs[1])  # Start with the first miR
+
+# Iterate through the miRs in 'top_high_spec_miRs'
+for (miR in top_high_spec_miRs[-1]) {  # Skip the first since it's already added
+    # Assume the miR can be added unless we find a correlation >= 0.5
+    can_add_miR <- TRUE
+    
+    # Check correlation with each already selected miR
+    for (added_miR in selected_miRs) {
+        cor_with_added_miR <- correlation_matrix[miR, added_miR]
+        
+        # If correlation with any added miR is 0.5 or more, break and do not add this miR
+        if (cor_with_added_miR >= 0.5) {
+            can_add_miR <- FALSE
+            break
+        }
+    }
+    
+    # Add miR to the selected list if all correlations were less than 0.5
+    if (can_add_miR) {
+        selected_miRs <- c(selected_miRs, miR)
+    }
+}
+
+# Print the selected miRs
+print(selected_miRs)
+```
+
+### Train and Test
+```{r , warning = FALSE}
+library(xgboost)
+library(e1071)
+library(caret)
+
+set.seed(1234)
+
+fit_my_model <- function(model_name, x, y) {
+  if (model_name == "svm") {
+    return(svm(x, y))
+  } else if (model_name == "logistic") {
+    return(multinom(x, y))  # Using nnet package for multinomial logistic regression
+  } else if (model_name == "random_forest") {
+    return(randomForest(x, y, type = "classification"))
+  } else if (model_name == "xgboost") {
+    data_dmatrix <- xgb.DMatrix(data = as.matrix(x), label = as.numeric(y) - 1)  # XGBoost requires zero-based indexing for labels
+    params <- list(objective = "multi:softmax", num_class = length(unique(y)))
+    return(xgb.train(params, data_dmatrix, nrounds = 100))  # nrounds can be adjusted
+  } else if (model_name == "naive_bayes") {
+    return(naiveBayes(x, y))
+  } else {
+    stop("Unsupported model type")
+  }
+}
+
+my_predict <- function(model_name, model, new_x){
+  prediction <- predict(model, new_x)
+  if(model_name == "xgboost"){
+    prediction <- factor(prediction + 1, levels = 1:length(levels(Y_test)))
+    levels(prediction) <- levels(Y_test)  
+  }
+  return(prediction)
+} 
+
+
+
+
+f <- file.path(paths$scratch, "svm_results.rda")
+rounds <- 5 #how many rounds you incrementally add features
+step_length <- 10 #number of features you add each round
+n_folds <- 5
+set.seed(12345)
+
+if(file.exists(f)){
+  load(f)
+} else {
+  # Prepare data
+  X <- as.data.frame(t(miRdata))
+  X$ctype <- as.factor(cancerType)
+  n_cancers <- length(unique(X$ctype))
+  
+  # Parameters
+  folds <- sample(rep(1:n_folds, length.out = nrow(X)))
+  accuracies <- list()
+  all_models <- list()
+  conf_matrices <- list()
+  models_names <- c("svm")
+  
+  # Initialize confusion matrices and accuracies for each feature selection method and model
+  for (feature_selection_method in c("High_Var", "High_Spec", "Diverse_High_Spec", "Combined")) {
+    for (model_name in models_names) {
+      storage_index <- paste0(feature_selection_method, "_", model_name)
+      for (i in seq_len(rounds)) {
+        conf_matrices[[storage_index]][[i]] <- matrix(0, ncol = n_cancers, nrow = n_cancers)
+      }
+      accuracies[[storage_index]] <- matrix(0, nrow = rounds, ncol = n_folds)
+    }
+  }
+  
+  for (i in seq_len(rounds)) {
+    num_features <- i * step_length
+    
+    for (fold in seq_len(n_folds)) {
+      test_indices <- (folds == fold)
+      X_train <- X[!test_indices, ]
+      X_test <- X[test_indices, ]
+      
+      features_list <- list(
+        High_Var = top_high_var_miRs[1:num_features],
+        High_Spec = top_high_spec_miRs[1:num_features],
+        Diverse_High_Spec = selected_miRs[1:num_features],
+        Combined = union(top_high_var_miRs[1:(num_features/2)], top_high_spec_miRs[1:(num_features/2)])
+      )
+      
+      for (feature_selection_method in names(features_list)) {
+        features <- features_list[[feature_selection_method]]
+        
+        X_train_subset <- X_train[, features, drop = FALSE]
+        Y_train <- X_train[, "ctype"]
+        X_test_subset <- X_test[, features, drop = FALSE]
+        Y_test <- X_test[, "ctype"]
+        
+        for (model_name in models_names){
+          # as.data.frame is for xgboost
+          model <- fit_my_model(model_name, x = as.matrix(X_train_subset), y = Y_train)
+          prediction <- my_predict(model_name, model, as.matrix(X_test_subset))
+          cm <- confusionMatrix(prediction, Y_test)
+          storage_index <- paste0(feature_selection_method, "_", model_name)
+          accuracies[[storage_index]][i, fold] <- cm$overall['Accuracy']
+          conf_matrices[[storage_index]][[i]] <- conf_matrices[[storage_index]][[i]] + as.matrix(cm$table)
+        }
+      }
+      print(paste("Iteration", i, "fold", fold, "completed."))
+    }
+  }
+  # Normalize confusion matrices after all folds
+  for (feature_selection_method in c("High_Var", "High_Spec", "Diverse_High_Spec", "Combined")) {
+    for (model_name in models_names) {
+      for (i in seq_len(rounds)) {
+        storage_index <- paste0(feature_selection_method, "_", model_name)
+        conf_matrices[[storage_index]][[i]] <- conf_matrices[[storage_index]][[i]] / n_folds
+      }
+    }
+  }
+  save(accuracies, conf_matrices, models_names, features_list, rounds, n_folds, file = f)
+}
+```
+
+### Transforming the list into a data frame suitable for plotting with ggplot2
+
+```{r , warning = FALSE}
+# Transforming the list into a data frame suitable for plotting with ggplot2
+accuracy_data <- data.frame()
+for (feature_selection_method in c("High_Var", "High_Spec", "Diverse_High_Spec", "Combined")) {
+  for (model_name in models_names) {
+    storage_index <- paste0(feature_selection_method, "_", model_name)
+    
+    for (round in seq_len(rounds)) {
+      for (fold in seq_len(n_folds)) {
+        accuracy_data <- rbind(accuracy_data, data.frame(
+          FeatureSelection = feature_selection_method,
+          Model = model_name,
+          NumberOfFeatures = round * step_length,
+          Fold = fold,
+          Accuracy = accuracies[[storage_index]][round, fold]
+        ))
+      }
+    }
+  }
+}
+```
+
+### Plotting
+```{r , warning = FALSE}
+library(dplyr)
+
+accuracy_summary <- accuracy_data %>%
+  group_by(FeatureSelection, NumberOfFeatures) %>%
+  summarise(
+    MeanAccuracy = mean(Accuracy),
+    SE = sd(Accuracy) / sqrt(n()),   # Standard Error
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    LowerCI = MeanAccuracy - SE * 1.96,  # Assuming a 95% confidence interval
+    UpperCI = MeanAccuracy + SE * 1.96
+  )
+
+# Update FeatureSelection labels for better readability
+accuracy_summary$FeatureSelection <- factor(accuracy_summary$FeatureSelection,
+  levels = c("High_Var", "High_Spec", "Diverse_High_Spec", "Combined"),
+  labels = c("Highly Variable Genes", "High Specificity Genes", "Diverse High Specificity Genes", "Combined Method")
+)
+
+library(ggplot2)
+
+# Define custom colors for each method
+method_colors <- c("Highly Variable Genes" = "red", 
+                   "High Specificity Genes" = "blue", 
+                   "Diverse High Specificity Genes" = "purple",
+                   "Combined Method" = "green")
+
+# Plotting
+accuracy_plot <- ggplot(accuracy_summary, aes(x = NumberOfFeatures, y = MeanAccuracy, color = FeatureSelection, group = FeatureSelection)) +
+  geom_line() +
+  geom_point(size = 3, shape = 19) +  # Adding points with specified size and shape
+  geom_ribbon(aes(ymin = LowerCI, ymax = UpperCI, fill = FeatureSelection), alpha = 0.2) +  # Adding shaded confidence interval
+  scale_color_manual(values = method_colors) +
+  scale_fill_manual(values = method_colors) +  # Ensure fill colors match line colors
+  labs(title = "Model Accuracy by Feature Selection Method",
+       x = "Number of Features",
+       y = "Average Test Accuracy",
+       color = "Feature Selection Method",
+       fill = "Feature Selection Method") +  # Label for the legend
+  theme_minimal() + 
+  theme(legend.position = c(0.9, 0.1),  # Sets the position of the legend inside the plot
+        legend.justification = c(1, 0),  # Anchors the legend at the bottom right
+        legend.background = element_rect(fill = "white", colour = "black"),  # Optional: Adds a background to the legend for visibility
+        legend.box.background = element_rect(color = "black", size = 0.5))  # Optional: Adds border to the legend box
+
+print(accuracy_plot)
+
+```
+
+
+## Viszualizing Error Sources
+Plotting the accuracies:
+
+```{r , warning = FALSE}
+library(ggplot2)
+library(reshape2)
+library(gridExtra)  # For arranging plots
+
+# Data extraction and manipulation
+i <- 1
+hvg_index <- "High_Var_svm"
+hsg_index <- "High_Spec_svm"
+
+hvg_matrix <- as.matrix(conf_matrices[[hvg_index]][[i]])
+hsg_matrix <- as.matrix(conf_matrices[[hsg_index]][[i]])
+diag(hvg_matrix) <- diag(hsg_matrix) <- 0  # Zeroing the diagonals
+
+conf_diff <- hvg_matrix - hsg_matrix
+diag(conf_diff) <- 0  # Zeroing the diagonal
+
+col_sums <- colSums(conf_diff) / pmax(colSums(hvg_matrix), colSums(hsg_matrix))
+row_sums <- rowSums(conf_diff) / pmax(rowSums(hvg_matrix), rowSums(hsg_matrix))
+
+# Prepare data for plotting
+conf_diff_long <- melt(conf_diff, varnames = c("Var1", "Var2"), value.name = "value")
+col_sums_df <- data.frame(Var = names(col_sums), Sum = col_sums)
+row_sums_df <- data.frame(Var = names(row_sums), Sum = row_sums)
+
+# Heatmap plot
+heatmap_plot <- ggplot(conf_diff_long, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  coord_fixed()  # Ensuring aspect ratio is 1
+
+# Column sum bars plot
+col_bar_plot <- ggplot(col_sums_df, aes(x = Var, y = Sum)) +
+  geom_col(fill = "gray") +
+  theme_minimal() +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(10,123,10,73))  # Removing all margins around the plot
+
+# Row sum bars plot
+row_bar_plot <- ggplot(row_sums_df, aes(x = Var, y = Sum)) +
+  geom_col(fill = "gray") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(15,20,25,20))  # Removing all margins around the plot
+
+# Arrange the plots using gridExtra
+grid.arrange(
+  col_bar_plot, nullGrob(), 
+  heatmap_plot, row_bar_plot,
+  ncol = 2, nrow = 2,
+  widths = c(4, 1), heights = c(1, 4)
+)
+
+```
+# Appendix
+It's always a good idea to finish up by reporting which versions of the
+software tools were used for this analysis:
+```{r si}
+sessionInfo()
+```
