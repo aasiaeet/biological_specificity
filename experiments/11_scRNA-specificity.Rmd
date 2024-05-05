@@ -26,6 +26,14 @@ The goal of this report is to check if our tissue specificity of miRs can be gen
 
 # Playing with Data
 
+```{r helper png saver, warning = FALSE, echo=FALSE}
+save_png_results <- function(p, file_name, res = 300){
+  png(file.path(paths$results, file_name), 
+      width=16*res, height=9*res, res=res, bg="white")  
+  grid.draw(p)
+  dev.off()
+}
+```
 
 First we want to get a sense of the Tabula Sepian data. For that we start with one tissue type and take a look into various parts of the available data. We picked blood because its data file had a reasonable ~1.5 G size, not too small, not too big. 
 
@@ -49,25 +57,64 @@ adata <- read_h5ad(f)
 
 Next, we tak a look at the transcripts. They seem to be normalized somehow:
 ```{r , warning = FALSE}
-length(adata$obs$cell_ontology_class)
-dim(adata$X)
+# length(adata$obs$cell_ontology_class)
+# dim(adata$X)
+# nClass <- unique(adata$obs$cell_ontology_class)
+# frq <- table(adata$obs$cell_ontology_class)
+# hist(frq, breaks = length(nClass), main = "Distribution of number of cells per cell type")
+# 
+# hist(adata$X[,colnames(adata$X)=='ACTB'], breaks=123, main='ACTB', xlab='CPM') #beta-actin - cytoskeleton gene
+# hist(adata$X[,colnames(adata$X)=='RPS18'], breaks=123, main='RPS18', xlab='CPM') #ribosomal protein s18 - ribosome gene
+# #specifically expressed in hemoglobin
+# hist(adata$X[,colnames(adata$X)=='HBA1'], breaks=123, main='HBA1', xlab='CPM') #hemoglobin subunit alpha 1
+# hist(adata$X[,colnames(adata$X)=='HBB'], breaks=123, main='HBB', xlab='CPM') #hemoglobin subunit beta
+
+
+library(ggplot2)
+
+# Assume 'adata' is your data object
+# Distribution of number of cells per cell type
 nClass <- unique(adata$obs$cell_ontology_class)
 frq <- table(adata$obs$cell_ontology_class)
-hist(frq, breaks = length(nClass), main = "Distribution of number of cells per cell type")
 
-# old_par <- par()
-# par(mfrow = c(3, 2))
-#random
-# hist(adata$X[,colnames(adata$X)=='BRAF'], breaks=123, main='BRAF', xlab='CPM')
-# hist(adata$X[,colnames(adata$X)=='TP53'], breaks=123, main='TP53', xlab='CPM')
-#mostly expressed
-hist(adata$X[,colnames(adata$X)=='ACTB'], breaks=123, main='ACTB', xlab='CPM') #beta-actin - cytoskeleton gene
-hist(adata$X[,colnames(adata$X)=='RPS18'], breaks=123, main='RPS18', xlab='CPM') #ribosomal protein s18 - ribosome gene
-#specifically expressed in hemoglobin
-hist(adata$X[,colnames(adata$X)=='HBA1'], breaks=123, main='HBA1', xlab='CPM') #hemoglobin subunit alpha 1
-hist(adata$X[,colnames(adata$X)=='HBB'], breaks=123, main='HBB', xlab='CPM') #hemoglobin subunit beta
-# par(old_par)
+# Convert frequency table to dataframe for ggplot
+frq_df <- data.frame(CellType = names(frq), Frequency = as.numeric(frq))
 
+# Plot histogram for cell type distribution
+ggplot(frq_df, aes(x = CellType, y = Frequency)) +
+  geom_col(fill = "#FF5733") +  # Using bars instead of hist since it's categorical
+  labs(title = "Distribution of Number of Cells Per Cell Type", x = "Cell Type", y = "Frequency") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 30, face = "bold"),
+    axis.title.x = element_text(size = 28),
+    axis.title.y = element_text(size = 28),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15)
+  )
+
+# Histograms for gene expressions like ACTB, RPS18, HBA1, HBB
+genes <- c("ACTB", "RPS18", "HBA1", "HBB")
+##beta-actin - cytoskeleton gene, ribosomal protein s18 - ribosome gene, hemoglobin subunit alpha 1, hemoglobin subunit beta
+for (gene in genes) {
+  gene_data <- data.frame(Expression = adata$X[, colnames(adata$X) == gene])
+  
+  # Creating ggplot histogram for each gene
+  p <- ggplot(gene_data, aes(x = Expression)) +
+    geom_histogram(bins = 123, fill = "#FF5733", color = "black") +
+    labs(title = paste("Expression of", gene), x = "CPM", y = "Frequency") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 30, face = "bold"),
+      axis.title.x = element_text(size = 28),
+      axis.title.y = element_text(size = 28),
+      axis.text.x = element_text(size = 15),
+      axis.text.y = element_text(size = 15)
+    )
+  
+  print(p)  
+  save_png_results(p, paste0('scrna-seq_ts_', gene, '.png'))
+}
 ```
 From the distribution of number of cells per cell type we can tell that there are many cell types that are very rare and the distribution is kind of bimodal: exponential in the lower end, uniform at the higher end. 
 
@@ -91,17 +138,19 @@ dim(X)
 ```
 
 Here we put together "Table 1", a count of the number of samples from each cell type.
+
 ```{r}
 tab <- table(ctype)
 length(tab)
 daft <- data.frame(tab)
-colnames(daft) <- c("Study Name", "Number of Samples")
+colnames(daft) <- c("Cell Type", "Number of Samples")
 write.csv(daft, file=file.path(paths$scratch, "sampleCount_TS_blood.csv"))
 head(daft)
-sum(ctype %in% names(tab[tab > 100]))
+paste("Number of cell types with more than 100 samples", sum((ctype) %in% names(tab[tab > 100])))
 S <- ctype %in% names(tab[tab > 100])
 subC <- droplevels(ctype[S])
 sX <- X[S,]
+dim(sX)
 ```
 
 
@@ -114,36 +163,35 @@ hist(1 - nnz/nrow(sX), breaks=123, col="gray75", main="",
      xlab="Fraction of zero counts per mRNA", ylab="Number of mRNAs")
 
 sum(nnz == 0)
-sum(nnz <= min(tab))
-
+# sum(nnz <= min(tab))
+min_cell_in_a_type <- min(table(subC))
+sum(nnz >= min_cell_in_a_type)
 ```
-So, there are 5989 mRNAs that have exactly zero count which we can not do anything about them. Also, if nnz < minimum number of samples per cell type, we can not do anything about them. So we remove those mRNAs from further consideration. 
+So, there are 6050 mRNAs that have exactly zero count which we can not do anything about them. Also, if nnz < minimum number of samples per cell type, we can not do anything about them. So we remove those mRNAs from further consideration. We order that mRNAs according to the number of zeros they have, i.e., mRNA with most zeros are processed first:
+
 
 ```{r , warning = FALSE}
-f <- file.path(paths$scratch, 'TS_sub_blood_10p.Rda') 
+f <- file.path(paths$scratch, 'TS_blood_sub_sample_sub_gene.Rda') 
 if (file.exists(f)) {
   load(f)
 } else {
-  ind <- nnz > 5000
+  ind <- nnz > min_cell_in_a_type #5000
   subX <- sX[,ind]
-  ctype <- subC
-  save(subX, ctype, file = f)
+  cell_type <- subC
+  library(Matrix)
+  nnz <- tabulate(subX@j + 1L, ncol(subX)) #nnz per column (mRNA)
+  gene_by_cell <- t(as.matrix((subX[,order(nnz)])))
+  gene_ordered <- sort(nnz)
+  save(gene_by_cell, cell_type, gene_ordered, file = f)
+  rm(X, sX, subX, subC, nnz, ind, tab, daft, frq_df)
+  gc()
 }
+
 ```
 
-We order that mRNAs according to the number of zeros they have, i.e., miRs with most zeros are processed first:
 
-```{r results}
-library(Matrix)
-nnz <- tabulate(subX@j + 1L, ncol(subX)) #nnz per column (mRNA)
-tempd <- t(as.matrix((subX[,order(nnz)])))
-nonzeros <- sort(nnz)
-```
 
-```{r makeRoom}
-rm(X, subX, subC)
-gc()
-```
+
 
 
 # Bayesian Mixture Rates
@@ -165,14 +213,14 @@ library(dplyr)
 # library(viridis)
 library(tictoc)
 set.seed(12345)
-beansdir<- file.path(paths$scratch, "BeanMixture-TS-Blood-10percent")
+beansdir<- file.path(paths$scratch, "BeanMixture-TS-Blood")
 if (!file.exists(beansdir)) dir.create(beansdir)
 res <- 300
-cohortColors <- viridis(length(unique(ctype)))
+cohortColors <- viridis(length(unique(cell_type)))
 
-f <- file.path(paths$scratch, 'allStat-TS-Blood_10p.rda')
-g <- file.path(paths$scratch, 'brlist-TS-Blood_10p.rda')
-h <- file.path(paths$scratch, 'postlist-TS-Blood_10p.rda')
+f <- file.path(paths$scratch, 'allStat-TS-Blood.rda')
+g <- file.path(paths$scratch, 'brlist-TS-Blood.rda')
+h <- file.path(paths$scratch, 'postlist-TS-Blood.rda')
 
 if (file.exists(f)) {
   load(f)
@@ -181,18 +229,18 @@ if (file.exists(f)) {
 } else {
   postlist <- brlist <- list()
   allStat <- c()
-  for (I in 1:length(nonzeros)) { #for each mRNA
+  for (I in 1:length(gene_ordered)) { #for each mRNA
   # for (mRNA in c('ARPC2', 'ATP5F1E', 'RPL12', 'RPL36', 'YWHAZ', 'ZFAND5')){
     tic()
     print(I)
-    mRNA <- rownames(tempd)[I]
+    mRNA <- rownames(gene_by_cell)[I]
     
-    # I <- which(rownames(tempd) == mRNA)
+    # I <- which(rownames(gene_by_cell) == mRNA)
     
     # make a binary vector of zero or not.
-    X <- c("NonZero", "Zero")[1 + 1*(tempd[I,] == 0)]
+    X <- c("NonZero", "Zero")[1 + 1*(gene_by_cell[I,] == 0)]
     cat("Working on", mRNA, "\n", file = stderr())
-    tab <- table(ctype, X)
+    tab <- table(cell_type, X)
     K <- tab[,1]
     N <- apply(tab, 1, sum)
     # Compute the posterior of the hyperpriors
@@ -214,7 +262,7 @@ if (file.exists(f)) {
   
     dev.off()
   
-    ourstats <- c(mRNA, nonzeros[I], mt, post$fisherC)
+    ourstats <- c(mRNA, gene_ordered[I], mt, post$fisherC)
     allStat <- rbind(allStat, ourstats)
     toc()
   }

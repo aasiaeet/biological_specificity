@@ -163,6 +163,15 @@ source("../methods/05_posterior_sampling.R")
 Now, we run our Bayesian inference pipeline on the microRNA data from the TCGA. We have already sorted them based on the number of non-zero elements. So we skip microRNAs that are always zero (of course they should get discarded) or always one (they should get retained, but if they are not variable they may not get selected in the selection process for the downstream analysis) for this analysis. 
 
 
+```{r helper png saver, warning = FALSE, echo=FALSE}
+save_png_results <- function(p, file_name, res = 300){
+  png(file.path(paths$results, file_name), 
+      width=16*res, height=9*res, res=res, bg="white")  
+  grid.draw(p)
+  dev.off()
+}
+```
+
 ```{r giant}
 library(dplyr)
 library(doParallel)
@@ -171,7 +180,6 @@ library(foreach)
 set.seed(12345)
 beansdir<- file.path(paths$scratch, "BeanMixture")
 if (!file.exists(beansdir)) dir.create(beansdir)
-res <- 300
 
 f <- file.path(paths$scratch, 'parallel_results.rda')
 if (file.exists(f)) {
@@ -184,13 +192,12 @@ if (file.exists(f)) {
   hi = quantile(nonzeros, 0.8)
   nonzeros_index = which(nonzeros >= lo & nonzeros <= hi)
   lengthnonzeros = length(nonzeros)
-  parallel_results <- foreach(I = nonzeros_index, .combine = 'list', .multicombine = TRUE, .packages = c("dplyr")) %dopar% {
+  parallel_results <- foreach(I = nonzeros_index, .combine = 'list', 
+                              .multicombine = TRUE, .packages = c("dplyr")) %dopar% {
 
     ### Added for dopar
     source("../methods/04_beta_mixture_rate_class.R")
     
-    print(I)
-    I
     mir <- rownames(ordered_mir_data)[I]
     # make a binary vector of zero or not.
     X <- c("NonZero", "Zero")[1 + 1*(ordered_mir_data[I,] == 0)]
@@ -198,32 +205,15 @@ if (file.exists(f)) {
     tab <- table(cancerType, X)
     K <- tab[,1]
     N <- apply(tab, 1, sum)
-    # Compute the posterior of the hyperpriors
-    print('@1')
+
+    # Fitting the Beta Mixture Rate model
     br <- BetaMixtureRates(K, N, dPi=1/10, massTrsh=0.87, resolution=10)
-    
-    print('@2')
-    ### brlist[[mir]] <- br
+
     # Sample from the joint posterior distribution.
     post <- samplePosteriorRates(br, dPi=1/10, nsamp = 4000)
-    
-    print('@3')
-    ### postlist[[mir]] <- post
-    
-    mt <- apply(post$theta, 2, mean)
-    O <- order(mt)
-    png(file=file.path(beansdir, paste(mir, "png", sep='.')), 
-        width=16*res, height=9*res, res=res, bg="white")
-    boxplot(as.matrix(post$theta[, O]), col=cohortColors[O], cex.axis=0.7,
-            ylab="Probability of Being NonZero",
-            main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
-                       formatC(post$fisherC, format = "e", digits = 2)), 
-            ylim=c(0,1), las=2)
-    dev.off()
   
     ourstats <- c(mir, nonzeros[I], mt, post$fisherC)
-    ### allStat <- rbind(allStat, ourstats)
-    
+
     list(mir=mir, br=br, post=post, ourstats=ourstats)
   }
   
@@ -267,27 +257,36 @@ Let's take a look at specificity (Fisher) scores distributions for all miRs:
 ```{r , warning = FALSE}
 library(ggplot2)
 
-# Assuming fc is your data vector
-# Applying log transformation directly in the data frame creation
-fc_data <- data.frame(Scores = log(fc))
+# Assuming fc is your data vector and log transformation is applied where needed
+fc_log <- log(fc)  # Apply log transformation
+mean_fc_log <- mean(fc_log)  # Calculate mean of log-transformed data
+sd_fc_log <- sd(fc_log)  # Calculate standard deviation
 
-# Creating a ggplot histogram with updated aesthetics
+# Creating a data frame
+fc_data <- data.frame(Scores = fc_log)
+
+# Plot
 fc_hist <- ggplot(fc_data, aes(x = Scores)) +
-  geom_histogram(bins = 50, fill = "#FF5733", color = "black") +  # Using a vibrant orange color
+  geom_histogram(bins = 50, fill = "#FF5733", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = mean_fc_log), color = "#0053BB", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = mean_fc_log + sd_fc_log), color = "#63BB00", linetype = "dotted", size = 1) +
+  geom_vline(aes(xintercept = mean_fc_log - sd_fc_log), color = "#63BB00", linetype = "dotted", size = 1) +
   labs(title = "CAPS Score Distribution", x = "Log of CAPS Score", y = "Frequency") +
-  theme_minimal() +  # Using a minimal theme
+  theme_minimal() +
   theme(
     plot.title = element_text(size = 30, face = "bold"),
     axis.title.x = element_text(size = 28),
     axis.title.y = element_text(size = 28),
     axis.text.x = element_text(size = 15),
     axis.text.y = element_text(size = 15),
-    legend.position = "none"  # No legend needed
-  )
+    legend.position = "none"
+  ) +
+  annotate("text", x = mean_fc_log, y = Inf, label = paste("Mean =", round(mean_fc_log, 2)), vjust = 1.5, color = "#0053BB") +
+  annotate("text", x = mean_fc_log + sd_fc_log, y = Inf, label = paste("+1 SD =", round(mean_fc_log + sd_fc_log, 2)), vjust = 2, color = "#63BB00") +
+  annotate("text", x = mean_fc_log - sd_fc_log, y = Inf, label = paste("-1 SD =", round(mean_fc_log - sd_fc_log, 2)), vjust = 2, color = "#63BB00")
 
-# Print the histogram
 print(fc_hist)
-
+save_png_results(fc_hist, 'caps_score_dist.png')
 
 ```
 
@@ -330,11 +329,7 @@ plot_the_boxes <- function(mir, mir_rates){
           legend.position = "none")  # Remove legend
 
   print(p)  # Print the plot
-  
-  res <- 300
-  png(file.path(paths$results, paste(mir, '_plot.png'), sep = ""), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
-  grid.draw(p)
-  dev.off()
+  save_png_results(p, paste(mir, '_plot.png'))
 }
 
 library(ggplot2)
@@ -427,12 +422,7 @@ miR_plot <- ggplot(miRdata_df, aes(x = MeanLogExpr, y = VarLogExpr)) +
 
 # Print the plot
 print(miR_plot)
-
-
-res <- 300
-png(file.path(paths$results, 'miR_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
-grid.draw(miR_plot)
-dev.off()
+save_png_results(miR_plot, 'miR_plot.png')
 ```
 
 Selecting highly variable microRNAs:
@@ -495,23 +485,9 @@ jaccard_plot <- ggplot(jaccard_data, aes(x = SetSize, y = JaccardDistance)) +
 
 # Print the plot
 print(jaccard_plot)
-
-res <- 300
-png(file.path(paths$results, 'jaccard_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
-grid.draw(jaccard_plot)
-dev.off()
-
-
-# 
-# 
-# # Plot the Jaccard distances
-# plot(jaccard_distances, type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-#      main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, number_of_highly_variable_mirs))
-# 
-# plot(jaccard_distances[1:100], type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-#      main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, 100))
-
+save_png_results(jaccard_plot, 'jaccard_plot.png')
 ```
+
 In the first 100 microRNA the two sets share only 12 microRNAs, i.e., the set of highly variable genes and highly specific genes are approximately mutually exclusive. In other words, if we focus on highly variable genes we will miss the highly specific genes. Even if we increase the set size up to 568 (total number of highly variable microRNAs), the Jaccard distance is still .5. 
 
 ## MicroRNAs with High CAPS Score are Informative
@@ -754,11 +730,7 @@ accuracy_plot <- ggplot(accuracy_summary, aes(x = NumberOfFeatures, y = MeanAccu
 
 
 print(accuracy_plot)
-
-res <- 300
-png(file.path(paths$results, 'accuracy_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
-grid.draw(accuracy_plot)
-dev.off()
+save_png_results(accuracy_plot, 'accuracy_plot.png')
 ```
 
 ## Viszualizing Error Sources
@@ -833,12 +805,7 @@ conf_plot <- grid.arrange(
   widths = c(4, 1), heights = c(1, 4)
 )
 
-
-res <- 300
-png(file.path(paths$results, 'confusion_plot.png'), width=16*res, height=9*res, res=res, bg="white")  # 800x600 pixels
-grid.draw(conf_plot)
-dev.off()
-
+save_png_results(conf_plot, 'confusion_plot.png')
 ```
 
 
