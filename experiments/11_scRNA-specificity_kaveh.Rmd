@@ -26,6 +26,7 @@ The goal of this report is to check if our tissue specificity of miRs can be gen
 
 # Playing with Data
 
+
 First we want to get a sense of the Tabula Sepian data. For that we start with one tissue type and take a look into various parts of the available data. We picked blood because its data file had a reasonable ~1.5 G size, not too small, not too big. 
 
 ## Data Exploration
@@ -35,7 +36,8 @@ rm(list = ls())
 source("../00_paths.R")
 ```
 
-```{r helper png saver, warning = FALSE, echo=FALSE}
+```{r}
+library('grid')
 save_png_results <- function(p, file_name, res = 300){
   png(file.path(paths$results, file_name), 
       width=16*res, height=9*res, res=res, bg="white")  
@@ -50,6 +52,7 @@ Then we read the data.
 # install.packages("reticulate")
 
 library(anndata)
+library(reticulate)
 
 f <- file.path(paths$clean, 'ts', 'TS_Blood.h5ad') 
 adata <- read_h5ad(f)
@@ -113,7 +116,7 @@ for (gene in genes) {
     )
   
   print(p)  
-  save_png_results(p, paste0('scrna-seq_ts_', gene, '.png'))
+  save_png_results(p, paste0('scrna-seq_ts_', gene, '.Png'))
 }
 ```
 From the distribution of number of cells per cell type we can tell that there are many cell types that are very rare and the distribution is kind of bimodal: exponential in the lower end, uniform at the higher end. 
@@ -194,6 +197,7 @@ if (file.exists(f)) {
 Here we just load the scripts where we have developed the model. 
 
 ```{r loading model scripts, warning = FALSE}
+library(dplyr)
 source("../methods/01_gamma_ratios.R")
 source("../methods/02_hyper_priors.R")
 source("../methods/03_integral_over_pi.R")
@@ -203,28 +207,37 @@ source("../methods/05_posterior_sampling.R")
 
 # Tabula Sapiens Blood sc-RNA Seq Analysis
 
-This is the place to do parallel:
 ```{r giant}
 library(dplyr)
+library(doParallel)
+library(foreach)
 library(viridis)
 library(tictoc)
+
 set.seed(12345)
 beansdir<- file.path(paths$scratch, "BeanMixture-TS-Blood")
 if (!file.exists(beansdir)) dir.create(beansdir)
 res <- 300
 cohortColors <- viridis(length(unique(cell_type)))
 
-
-f <- file.path(paths$scratch, 'parallel_results_ts_blood.rda')
-
-
+f <- file.path(paths$scratch, 'parallel_results_ts.rda')
 if (file.exists(f)) {
   load(f)
 } else {
-  postlist <- brlist <- list()
-  allStat <- c()
-  for (I in 1:length(gene_ordered)) { #for each mRNA
   # for (mRNA in c('ARPC2', 'ATP5F1E', 'RPL12', 'RPL36', 'YWHAZ', 'ZFAND5')){
+  numCores <- parallel::detectCores()  # Use detectCores from the parallel package
+  cl <- makeCluster(32)
+  registerDoParallel(cl)
+  #lo = quantile(nonzeros, 0.05)
+  #hi = quantile(nonzeros, 0.8)
+  # nonzeros_index = which(nonzeros >= lo & nonzeros <= hi)
+  print('Satarting dopar ...')
+  parallel_results_ts <- foreach(I = 1:length(gene_ordered), .combine = 'list',
+                                 .multicombine = FALSE, .packages = c("dplyr", "tictoc")) %dopar% {
+
+    ### Added for dopar
+    source("../methods/04_beta_mixture_rate_class.R")
+    
     tic()
     print(I)
     mRNA <- rownames(gene_by_cell)[I]
@@ -239,10 +252,10 @@ if (file.exists(f)) {
     N <- apply(tab, 1, sum)
     # Compute the posterior of the hyperpriors
     br <- BetaMixtureRates(K, N, dPi=1/5, massTrsh=0.87, resolution=10)
-    brlist[[mRNA]] <- br
+    ###brlist[[mRNA]] <- br
     # Sample from the joint posterior distribution.
     post <- samplePosteriorRates(br, dPi=1/5, nsamp = 1000)
-    postlist[[mRNA]] <- post
+    ###postlist[[mRNA]] <- post
     
     mt <- apply(post$theta, 2, mean)
     O <- order(mt)
@@ -256,157 +269,160 @@ if (file.exists(f)) {
   
     dev.off()
   
+    ###allStat <- rbind(allStat, ourstats)
     ourstats <- c(mRNA, gene_ordered[I], mt, post$fisherC)
-    allStat <- rbind(allStat, ourstats)
     toc()
+    list(mir=mRNA, br=br, post=post, ourstats=ourstats)
   }
-  rownames(allStat) <- allStat[,1] #mRNAs as rownames
-  allStat <- allStat[,-1]
-  colnames(allStat)[c(1, ncol(allStat))] <- c("nnz", "fisherC")
-  allStat <- matrix(as.numeric(allStat), 
-                    ncol = ncol(allStat), dimnames = dimnames(allStat))
+  
+  stopCluster(cl)
+  
+  save(parallel_results_ts, file=f)
+  
+  ###rownames(allStat) <- allStat[,1] #mRNAs as rownames
+  ###allStat <- allStat[,-1]
+  ###colnames(allStat)[c(1, ncol(allStat))] <- c("nnz", "fisherC")
+  ###allStat <- matrix(as.numeric(allStat), 
+  ##                  ncol = ncol(allStat), dimnames = dimnames(allStat))
 
-  save(allStat, file = f)
-  save(brlist, file = g)
-  save(postlist, file = h)
+  ###save(allStat, file = f)
+  ###save(brlist, file = g)
+  ###save(postlist, file = h)
 }
-rm(f, g, h)
+rm(f)
 ```
 
-
 ```{r}
-f <- file.path(paths$scratch, 'allStat-TS-Blood.rda')
-g <- file.path(paths$scratch, 'brlist-TS-Blood.rda')
-h <- file.path(paths$scratch, 'postlist-TS-Blood.rda')
-postlist <- brlist <- list()
-allStat <- c()
-  
+f <- file.path(paths$scratch, 'allStat_ts.rda')
+g <- file.path(paths$scratch, 'brlist_ts.rda')
+h <- file.path(paths$scratch, 'postlist_ts.rda')
+
 if (!file.exists(f)) {
-  for (i in 1:length(parallel_results)) {
-    single_result = parallel_results[[i]]
-    mRNA <- single_result$mRNA
-    brlist[[mRNA]] <- single_result$br
-    postlist[[mRNA]] <- single_result$post
+  postlist <- brlist <- list()
+  allStat <- c()
+  for (i in 1:length(parallel_results_ts)) {
+    single_result = parallel_results_ts[[i]]
+    mir <- single_result$mir
+    brlist[[mir]] <- single_result$br
+    postlist[[mir]] <- single_result$post
     allStat <- rbind(allStat, single_result$ourstats)
   }
   
   rownames(allStat) <- allStat[,1] #mirs as rownames
   allStat <- allStat[,-1]
-  colnames(allStat)[c(1, 33)] <- c("nonzero", "fisherC")
-  allStat <- matrix(as.numeric(allStat), ncol = ncol(allStat), dimnames = dimnames(allStat))
+  colnames(allStat)[c(1, 18)] <- c("nonzero", "fisherC")
+  allStat <- matrix(as.numeric(allStat), ncol = ncol(allStat), 
+                    dimnames = dimnames(allStat))
 
   save(allStat, file = f)
   save(brlist, file = g)
   save(postlist, file = h)
+} else {
+  load(f)
+  load(g)
+  load(h)
 }
 rm(f, g, h)
 ```
-
-
 
 ## Inspecting the Specificity Statistics
 Let's take a look at specificity (Fisher) scores distributions for all miRs:
 ```{r , warning = FALSE}
 dim(allStat)
-fc <- allStat[,33]
+fc <- allStat[,18]
 sum(fc > 1)
-sum(fc > 100)
-fc[order(fc,decreasing = T)[1:4]]
-hist(fc[fc<100], breaks = 100, main = "Biological Specificity Scores")
+sum(fc > 25)
+fc[order(fc,decreasing = T)[1:8]]
+hist(fc[fc<25], breaks = 100, main = "Biological Specificity Scores")
 ```
 There are four miRs which are extremely specific (the BSS is great than 300). After that the score drops to 21. 
 There are 199 miRs with specificity > 1. 
 Let's plot the extremes:
 
 ```{r manip, warning = FALSE}
-for(mir in rownames(allStat)[which(fc > 50)]){
-  x <- allStat[mir, 2:32]
+for(mRNA in rownames(allStat)[which(fc > 25)]){
+  x <- allStat[mRNA, 2:17]
   par(mfrow=c(1,2))  
-  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
+  hist(x, breaks = 50, main = paste("Cell Type Separation by mRNA", mRNA));
   O <- order(x)
-  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
+  boxplot(as.matrix(postlist[[mRNA]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
         ylab="Probability of Being NonZero",
-        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
-                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
+        main=paste("Posterior Dist. of Thetas for", mRNA, "Cell Type Specificity = ", 
+                   formatC(postlist[[mRNA]]$fisherC, format = "e", digits = 2)), 
         ylim=c(0,1), las=2)
 }
 ```
-
-Interestingly, in all these four cases the miRNA separates OV, COAD, READ from the rest of cancer types, while the expression pattern is different: in the first one it is only present in those cancer (a clear case of why we should keep `hsa-miR-3913-5p`) while in the next three it is present everywhere except in those three. 
 
 Let's skip the extremes and take another look at the histogram and the Contextual Absence/Presence Specificity (CAPS) scores' tail:
 ```{r truncHist, warning = FALSE}
-hist(fc[-which(fc > 50)], breaks = 50, main = "PAC Score")
+hist(fc[-which(fc > 15)], breaks = 50, main = "PAC Score")
 
-for(mir in rownames(allStat)[which(fc > 10 & fc < 50)]){
-  x <- allStat[mir, 2:32]
+for(mRNA in rownames(allStat)[which(fc > 15 & fc < 25)]){
+  x <- allStat[mRNA, 2:17]
   par(mfrow=c(1,2))  
-  hist(x, breaks = 50, main = paste("Tissue Separation by miR", mir));
+  hist(x, breaks = 50, main = paste("Cell type Separation by mRNA", mRNA));
   O <- order(x)
-  boxplot(as.matrix(postlist[[mir]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
+  boxplot(as.matrix(postlist[[mRNA]]$theta[, O]), col=cohortColors[O], cex.axis=0.7,
         ylab="Probability of Being NonZero",
-        main=paste("Posterior Dist. of Thetas for", mir, "Tissue Specificity = ", 
-                   formatC(postlist[[mir]]$fisherC, format = "e", digits = 2)), 
+        main=paste("Posterior Dist. of Thetas for", mRNA, "Tissue Specificity = ", 
+                   formatC(postlist[[mRNA]]$fisherC, format = "e", digits = 2)), 
         ylim=c(0,1), las=2)
 }
 ```
-Still it seems that large FC corresponds to clear separability of means, i.e., we have two clusters of tissues. 
 
-## MicroRNAs with High PAC Score are Different from Highly Variable MicroRNAs
+## MRNA with High CAPS Score are Different from Highly Variable mRNAs
 
-To demonstrate that PAC score captures biological significance, we compare the efficacy of microRNAs (miRs) selected based on high PAC scores against miRs chosen for their high variability. This comparison aims to elucidate whether PAC scores can indeed reflect biological relevance similar to or better than traditional methods of feature selection based on variability.
+To demonstrate that CAPS score captures biological significance, we compare the efficacy of mRNA selected based on high CAPS scores against mRNAs chosen for their high variability. This comparison aims to elucidate whether CAPS scores can indeed reflect biological relevance similar to or better than traditional methods of feature selection based on variability.
 
-
-First, let's remember that the data was CPM normalized:
-```{r , warning = FALSE}
-hist(miRdata[1,], breaks = 123)
-```
-
- 
-An essential step in the transcriptome analysis pipeline involves feature selection, especially for data characterized by frequent zeros or generally constant features. Eliminating such features is critical for enhancing the performance of downstream tasks. The conventional approach to determining high variability involves calculating the mean and variance of log-transformed expression levels and selecting miRs that stand out in terms of variability. We do this by fitting a Lowess curve to the variance vs. mean of log transformed expressions and select the miRs whose variance is greater than the variance predicted by this curve. This process highlights miRs that exhibit significant expression changes across samples, potentially reflecting crucial biological processes or states.
+An essential step in the transcriptome analysis pipeline involves feature selection, especially for data characterized by frequent zeros or generally constant features. Eliminating such features is critical for enhancing the performance of downstream tasks. The conventional approach to determining high variability involves calculating the mean and variance of log-transformed expression levels and selecting genes that stand out in terms of variability. We do this using the functions available in the Seurat package. 
 
 ```{r , warning = FALSE}
-# Log-transform the data (adding 1 to avoid log(0))
-log_miRdata <- log2(miRdata + 1)
+f <- file.path(paths$scratch, "top_high_var_mrnas_ts.rda")
+number_of_highly_variable_mrnas <- 2000
 
-mean_log_expr <- rowMeans(log_miRdata)
-var_log_expr <- apply(log_miRdata, 1, var)
+if(!file.exists(f)){
+  library(Seurat)
+  # Create a Seurat object
+  seurat_object <- CreateSeuratObject(counts = gene_by_cell)
+  
+  # Normalize the data
+  seurat_object <- NormalizeData(seurat_object, normalization.method = "LogNormalize", scale.factor = 10000)
+  
+  # Identify highly variable genes
+  seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", 
+                                        nfeatures = number_of_highly_variable_mrnas)
+  
+  # Get the list of highly variable genes
+  top_high_var_mrnas <- VariableFeatures(seurat_object)
+  
+  save(top_high_var_mrnas, seurat_object, file = f)
+} else {
+  load(f)
+}
+# Plot variable features
+VariableFeaturePlot(seurat_object)
 
-# Fit a lowess curve to the variance vs. mean log expression
-lowess_fit <- lowess(mean_log_expr, var_log_expr)
-
-# Plot the variance vs. mean log expression with the lowess curve
-plot(mean_log_expr, var_log_expr, xlab = "Mean of Log Expression", ylab = "Variance of Log Expression",
-     main = "Variability of microRNAs with Lowess Fit", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.4))
-lines(lowess_fit, col = "red", lwd = 2)
-
-# Identify microRNAs with variance above the lowess fit as highly variable
-high_var_indices <- var_log_expr > approx(lowess_fit$x, lowess_fit$y, xout = mean_log_expr)$y
-print(paste("Total number of highly variable microRNAs", sum(high_var_indices)))
-number_of_highly_variable_mirs <- sum(high_var_indices)
-
-high_var_miRs <- rownames(miRdata)[high_var_indices]
-top_high_var_miRs <- head(high_var_miRs[order(-var_log_expr[high_var_indices])], number_of_highly_variable_mirs)
 ```
 
+Note that the FindVariableFeatures function is a bit different than our procedure for selecting highly variable microRNAs but I don't think the order of highly variable genes will be different. Here they use the fitted log(var) (to the log(mean)) and standardized (z-score) the expression values. Then compute the variance of the z-scored values. It is expected that if the gene's variance is much larger (smaller) than the fitted variance, then the variance of z-score should be larger (smaller) than one. 
 
 We select the similar number of miRs from the list of miRs sorted decreasingly according to their PAC scores. The goal is to determine if the two lists are similar. 
 ```{r , warning = FALSE}
-sorted_mir_pac_score <- names(fc)[order(fc, decreasing = T)] 
-top_high_spec_miRs <- head(sorted_mir_pac_score, number_of_highly_variable_mirs)
+sorted_mrna_pac_score <- names(fc)[order(fc, decreasing = T)] 
+top_high_spec_mrnas <- head(sorted_mrna_pac_score, number_of_highly_variable_mrnas)
 ```
 
 Let's check if the two sets share a lot of elements:
 ```{r , warning = FALSE}
-# Assuming top_high_var_miRs and top_high_spec_miRs are your microRNA sets
+# Assuming top_high_var_mrnas and top_high_spec_mrnas are your microRNA sets
 
 # Initialize a vector to store Jaccard distances
-jaccard_distances <- numeric(number_of_highly_variable_mirs)
+jaccard_distances <- numeric(number_of_highly_variable_mrnas)
 
 # Calculate Jaccard distances for set sizes 1 to 100
-for (i in 1:number_of_highly_variable_mirs) {
-  set1 <- top_high_var_miRs[1:i]
-  set2 <- top_high_spec_miRs[1:i]
+for (i in 1:number_of_highly_variable_mrnas) {
+  set1 <- top_high_var_mrnas[1:i]
+  set2 <- top_high_spec_mrnas[1:i]
   
   # Calculate intersection and union
   intersection_size <- length(intersect(set1, set2))
@@ -418,54 +434,54 @@ for (i in 1:number_of_highly_variable_mirs) {
 
 # Plot the Jaccard distances
 plot(jaccard_distances, type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, number_of_highly_variable_mirs))
+     main = "Jaccard Distance between Top mRNA Sets", xlim = c(1, number_of_highly_variable_mrnas))
 
 plot(jaccard_distances[1:100], type = "b", pch = 19, xlab = "Set Size", ylab = "Jaccard Distance",
-     main = "Jaccard Distance between Top microRNAs Sets", xlim = c(1, 100))
+     main = "Jaccard Distance between Top mRNA Sets", xlim = c(1, 100))
 
 ```
-In the first 100 microRNA the two sets share only 12 microRNAs, i.e., the set of highly variable genes and highly specific genes are approximately mutually exclusive. In other words, if we focus on highly variable genes we will miss the highly specific genes. Even if we increase the set size up to 568 (total number of highly variable microRNAs), the Jaccard distance is still .5. 
+In the first 100 mRNAs the two sets share only one microRNAs, i.e., the set of highly variable genes and highly specific genes are approximately mutually exclusive. In other words, if we focus on highly variable genes we will miss the highly specific genes. Even if we increase the set size up to 2000 (total number of highly variable mRNAs we picked), the Jaccard distance is still 0.89.
 
-## MicroRNAs with High PAC Score are Informative
-Here, we juxtapose miRs selected based on their high variability with those chosen for their high PAC scores. The aim is to assess the informational content of miRs selected via each criterion, particularly focusing on the biological insights they provide. We do this by using selected miRs by two criteria to perform cancer type classification. We run SVM 10 times while incrementally increasing the number of microRNAs considered by 10 for each of the two sets of selected miRNAs, and then plotting the performance of these selection methods on cancer type classification. 
+## MRNAs with High CAPS Score are Informative
+Here, we juxtapose genes selected based on their high variability with those chosen for their high CAPS scores. The aim is to assess the informational content of genes selected via each criterion, particularly focusing on the biological insights they provide. We do this by using selected genes by two criteria to perform cell type classification. We run SVM 10 times while incrementally increasing the number of genes considered by 10 for each of the two sets of selected miRNAs, and then plotting the performance of these selection methods on cell type classification. 
 
 ### Intelligent Highly Specific Feature Addition
 
 ```{r , warning = FALSE}
 allStat_filtered <- allStat[, -c(1, ncol(allStat))]
-miR_mean_representation <- allStat_filtered[rownames(allStat_filtered) %in% top_high_spec_miRs, ]
-correlation_matrix <- cor(t(miR_mean_representation))
+gene_mean_representation <- allStat_filtered[rownames(allStat_filtered) %in% top_high_spec_mrnas, ]
+correlation_matrix <- cor(t(gene_mean_representation))
 
 
 # Initialize the list of selected miRs
-selected_miRs <- c(top_high_spec_miRs[1])  # Start with the first miR
+selected_mrnas <- c(top_high_spec_mrnas[1])  # Start with the first miR
 
-# Iterate through the miRs in 'top_high_spec_miRs'
-for (miR in top_high_spec_miRs[-1]) {  # Skip the first since it's already added
-    # Assume the miR can be added unless we find a correlation >= 0.5
-    can_add_miR <- TRUE
+# Iterate through the miRs in 'top_high_spec_mrnas'
+for (mrna in top_high_spec_mrnas[-1]) {  # Skip the first since it's already added
+    # Assume the mrna can be added unless we find a correlation >= 0.5
+    can_add_mrna <- TRUE
     
-    # Check correlation with each already selected miR
-    for (added_miR in selected_miRs) {
-        cor_with_added_miR <- correlation_matrix[miR, added_miR]
+    # Check correlation with each already selected mrna
+    for (added_mrna in selected_mrnas) {
+        cor_with_added_mrna <- correlation_matrix[mrna, added_mrna]
         
-        # If correlation with any added miR is 0.5 or more, break and do not add this miR
-        if (cor_with_added_miR >= 0.5) {
-            can_add_miR <- FALSE
+        # If correlation with any added mrna is 0.5 or more, break and do not add this mrna
+        if (cor_with_added_mrna >= 0.9) {
+            can_add_mrna <- FALSE
             break
         }
     }
     
-    # Add miR to the selected list if all correlations were less than 0.5
-    if (can_add_miR) {
-        selected_miRs <- c(selected_miRs, miR)
+    # Add mrna to the selected list if all correlations were less than 0.5
+    if (can_add_mrna) {
+        selected_mrnas <- c(selected_mrnas, mrna)
     }
 }
 
-# Print the selected miRs
-print(selected_miRs)
+# Print the selected mrnas
+print(selected_mrnas)
 ```
-
+This is interesting: we add the new gene to the selected set only if it's correlation is less than .9 with all the previously added genes. This means that genes are more correlated that miRNAs (where the threshold of .5 was determined manually). Here if we set the correlation threshold .5, only 17 genes are getting selected, i.e., if 
 ### Train and Test
 ```{r , warning = FALSE}
 library(xgboost)
@@ -501,25 +517,23 @@ my_predict <- function(model_name, model, new_x){
   return(prediction)
 } 
 
+```
 
 
+```{r , warning = FALSE}
 
-f <- file.path(paths$scratch, "svm_results.rda")
-rounds <- 5 #how many rounds you incrementally add features
+f <- file.path(paths$scratch, "svm_results_ts.rda")
+rounds <- 10 #how many rounds you incrementally add features
 step_length <- 10 #number of features you add each round
-n_folds <- 5
+n_folds <- 10
 set.seed(12345)
 
 if(file.exists(f)){
   load(f)
 } else {
-  # Prepare data
-  X <- as.data.frame(t(miRdata))
-  X$ctype <- as.factor(cancerType)
-  n_cancers <- length(unique(X$ctype))
-  
+  n_cell_types <- length(unique(cell_type))
   # Parameters
-  folds <- sample(rep(1:n_folds, length.out = nrow(X)))
+  folds <- sample(rep(1:n_folds, length.out = ncol(gene_by_cell)))
   accuracies <- list()
   all_models <- list()
   conf_matrices <- list()
@@ -530,7 +544,7 @@ if(file.exists(f)){
     for (model_name in models_names) {
       storage_index <- paste0(feature_selection_method, "_", model_name)
       for (i in seq_len(rounds)) {
-        conf_matrices[[storage_index]][[i]] <- matrix(0, ncol = n_cancers, nrow = n_cancers)
+        conf_matrices[[storage_index]][[i]] <- matrix(0, ncol = n_cell_types, nrow = n_cell_types)
       }
       accuracies[[storage_index]] <- matrix(0, nrow = rounds, ncol = n_folds)
     }
@@ -541,23 +555,21 @@ if(file.exists(f)){
     
     for (fold in seq_len(n_folds)) {
       test_indices <- (folds == fold)
-      X_train <- X[!test_indices, ]
-      X_test <- X[test_indices, ]
       
       features_list <- list(
-        High_Var = top_high_var_miRs[1:num_features],
-        High_Spec = top_high_spec_miRs[1:num_features],
-        Diverse_High_Spec = selected_miRs[1:num_features],
-        Combined = union(top_high_var_miRs[1:(num_features/2)], top_high_spec_miRs[1:(num_features/2)])
+        High_Var = top_high_var_mrnas[1:num_features],
+        High_Spec = top_high_spec_mrnas[1:num_features],
+        Diverse_High_Spec = selected_mrnas[1:num_features],
+        Combined = union(top_high_var_mrnas[1:(num_features/2)], top_high_spec_mrnas[1:(num_features/2)])
       )
       
       for (feature_selection_method in names(features_list)) {
         features <- features_list[[feature_selection_method]]
         
-        X_train_subset <- X_train[, features, drop = FALSE]
-        Y_train <- X_train[, "ctype"]
-        X_test_subset <- X_test[, features, drop = FALSE]
-        Y_test <- X_test[, "ctype"]
+        X_train_subset <- t(gene_by_cell[features, !test_indices, drop = FALSE])
+        Y_train <- cell_type[!test_indices]
+        X_test_subset <- t(gene_by_cell[features, test_indices, drop = FALSE])
+        Y_test <- cell_type[test_indices]
         
         for (model_name in models_names){
           # as.data.frame is for xgboost
@@ -668,7 +680,8 @@ Plotting the accuracies:
 ```{r , warning = FALSE}
 library(ggplot2)
 library(reshape2)
-library(gridExtra)  # For arranging plots
+library(gridExtra)
+library(grid)
 
 # Data extraction and manipulation
 i <- 1
@@ -726,13 +739,14 @@ row_bar_plot <- ggplot(row_sums_df, aes(x = Var, y = Sum)) +
         plot.margin = margin(15,20,25,20))  # Removing all margins around the plot
 
 # Arrange the plots using gridExtra
-grid.arrange(
+conf_plot <- grid.arrange(
   col_bar_plot, nullGrob(), 
   heatmap_plot, row_bar_plot,
   ncol = 2, nrow = 2,
   widths = c(4, 1), heights = c(1, 4)
 )
 
+save_png_results(conf_plot, 'confusion_plot_ts.png')
 ```
 # Appendix
 It's always a good idea to finish up by reporting which versions of the
